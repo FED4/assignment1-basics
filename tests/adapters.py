@@ -11,6 +11,13 @@ from jaxtyping import Bool, Float, Int
 from torch import Tensor
 
 from cs336_basics.bpe_tokenizer import bpe_tokenizer
+from cs336_basics.linear import Linear
+from cs336_basics.embedding import Embedding
+from cs336_basics.rmsnorm import RMSNorm
+from cs336_basics.swiglu import SwiGLU
+from cs336_basics.rope import RoPE
+from cs336_basics.softmax import Softmax
+from cs336_basics.attention import ScaledDotProductAttention, MultiHeadSelfAttention
 
 
 def run_linear(
@@ -32,7 +39,11 @@ def run_linear(
         Float[Tensor, "... d_out"]: The transformed output of your linear module.
     """
 
-    return in_features @ weights.T
+    linear = Linear(d_in, d_out)
+    state_dict = linear.state_dict()
+    state_dict["weight"] = weights
+    linear.load_state_dict(state_dict)
+    return linear(in_features)
 
 
 def run_embedding(
@@ -53,8 +64,11 @@ def run_embedding(
     Returns:
         Float[Tensor, "... d_model"]: Batch of embeddings returned by your Embedding layer.
     """
-
-    return weights[token_ids]
+    embedding = Embedding(vocab_size, d_model)
+    state_dict = embedding.state_dict()
+    state_dict["embedding_matrix"] = weights
+    embedding.load_state_dict(state_dict)
+    return embedding(token_ids)
 
 
 def run_swiglu(
@@ -86,7 +100,14 @@ def run_swiglu(
     # swiglu.w1.weight.data = w1_weight
     # swiglu.w2.weight.data = w2_weight
     # swiglu.w3.weight.data = w3_weight
-    return (run_silu(run_linear(d_model, d_ff, w1_weight, in_features)) * run_linear(d_model, d_ff, w3_weight, in_features)) @ w2_weight.T
+    swiglu = SwiGLU(d_model, d_ff)
+    state_dict = swiglu.state_dict()
+    state_dict["W1"] = w1_weight
+    state_dict["W2"] = w2_weight
+    state_dict["W3"] = w3_weight
+    swiglu.load_state_dict(state_dict)
+ 
+    return swiglu(in_features)
 
 
 def run_scaled_dot_product_attention(
@@ -107,10 +128,8 @@ def run_scaled_dot_product_attention(
     Returns:
         Float[Tensor, " ... queries d_v"]: Output of SDPA
     """
-    scores = Q @ K.transpose(-2, -1) / math.sqrt(Q.shape[-1])
-    if mask is not None:
-        scores = scores.masked_fill(~mask, float("-inf"))
-    return run_softmax(scores, dim=-1) @ V
+    scaled_dot_product_attention = ScaledDotProductAttention()
+    return scaled_dot_product_attention(Q, K, V, mask)
 
 
 def _causal_mask(sequence_length: int, device: torch.device) -> Tensor:
@@ -203,16 +222,15 @@ def run_multihead_self_attention_with_rope(
         Float[Tensor, " ... sequence_length d_model"]: Tensor with the output of running your optimized, batched multi-headed attention
         implementation with the given QKV projection weights and input features.
     """
-    q = _split_heads(run_linear(d_model, d_model, q_proj_weight, in_features), num_heads)
-    k = _split_heads(run_linear(d_model, d_model, k_proj_weight, in_features), num_heads)
-    v = _split_heads(run_linear(d_model, d_model, v_proj_weight, in_features), num_heads)
-    sequence_length = in_features.shape[-2]
-    if token_positions is None:
-        token_positions = torch.arange(sequence_length, device=in_features.device)
-    q = run_rope(d_model // num_heads, theta, max_seq_len, q, token_positions)
-    k = run_rope(d_model // num_heads, theta, max_seq_len, k, token_positions)
-    attn_output = run_scaled_dot_product_attention(q, k, v, _causal_mask(sequence_length, in_features.device))
-    return run_linear(d_model, d_model, o_proj_weight, _merge_heads(attn_output))
+
+    multihead_self_attention_with_rope = MultiHeadSelfAttention(d_model, num_heads)
+    state_dict = multihead_self_attention_with_rope.state_dict()
+    state_dict["W_Q"] = q_proj_weight
+    state_dict["W_K"] = k_proj_weight
+    state_dict["W_V"] = v_proj_weight
+    state_dict["W_O"] = o_proj_weight
+    multihead_self_attention_with_rope.load_state_dict(state_dict)
+    return multihead_self_attention_with_rope(in_features, theta, token_positions)
 
 
 def run_rope(
@@ -236,18 +254,8 @@ def run_rope(
     """
     dtype = in_query_or_key.dtype
     device = in_query_or_key.device
-    positions = token_positions.to(device=device)
-    frequencies = theta ** (-torch.arange(0, d_k, 2, device=device, dtype=dtype) / d_k)
-    angles = positions.to(dtype).unsqueeze(-1) * frequencies
-    x_even = in_query_or_key[..., 0::2]
-    x_odd = in_query_or_key[..., 1::2]
-    while angles.ndim < x_even.ndim:
-        angles = angles.unsqueeze(-3)
-    cos = torch.cos(angles)
-    sin = torch.sin(angles)
-    output = torch.empty_like(in_query_or_key)
-    output[..., 0::2] = x_even * cos - x_odd * sin
-    output[..., 1::2] = x_even * sin + x_odd * cos
+    rope = RoPE(theta, d_k, max_seq_len, device, dtype)
+    output = rope(in_query_or_key, token_positions)
     return output
 
 
@@ -462,9 +470,11 @@ def run_rmsnorm(
         Float[Tensor,"... d_model"]: Tensor of with the same shape as `in_features` with the output of running
         RMSNorm of the `in_features`.
     """
-    in_dtype = in_features.dtype
-    normalized = in_features.to(torch.float32) * torch.rsqrt(torch.mean(in_features.to(torch.float32) ** 2, dim=-1, keepdim=True) + eps)
-    return (normalized * weights).to(in_dtype)
+    rmsnorm = RMSNorm(d_model, eps)
+    state_dict = rmsnorm.state_dict()
+    state_dict["gain"] = weights
+    rmsnorm.load_state_dict(state_dict)
+    return rmsnorm(in_features)
 
 
 def run_silu(in_features: Float[Tensor, " ..."]) -> Float[Tensor, " ..."]:
@@ -522,9 +532,8 @@ def run_softmax(in_features: Float[Tensor, " ..."], dim: int) -> Float[Tensor, "
         Float[Tensor, "..."]: Tensor of with the same shape as `in_features` with the output of
         softmax normalizing the specified `dim`.
     """
-    shifted = in_features - torch.max(in_features, dim=dim, keepdim=True).values
-    exp = torch.exp(shifted)
-    return exp / torch.sum(exp, dim=dim, keepdim=True)
+    softmax = Softmax()
+    return softmax(in_features, dim=dim)
 
 
 def run_cross_entropy(

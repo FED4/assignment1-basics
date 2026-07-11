@@ -1,9 +1,18 @@
+import heapq
 from collections import Counter, defaultdict
 
 import regex
 
 
 PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
+
+
+class _ReversePair:
+    def __init__(self, pair):
+        self.pair = pair
+
+    def __lt__(self, other):
+        return self.pair > other.pair
 
 
 class bpe_tokenizer:
@@ -25,6 +34,13 @@ class bpe_tokenizer:
         special_tokens = sorted(self.special_tokens, key=len, reverse=True)
         return "(" + "|".join(regex.escape(token) for token in special_tokens) + ")"
 
+    def from_files(cls, vocab_filepath, merge_filepath, special_tokens=None):
+        with open(vocab_filepath, encoding="utf-8") as f:
+            vocab = {i: line.strip() for i, line in enumerate(f)}
+        with open(merge_filepath, encoding="utf-8") as f:
+            merges = [line.strip().split() for line in f]
+        return cls(vocab, merges, special_tokens)
+    
     def decode(self, tokens):
         data_bytes = b"".join(self.vocab[token] for token in tokens)
         return data_bytes.decode("utf-8", errors="replace")
@@ -70,11 +86,17 @@ class bpe_tokenizer:
         for i, special_token in enumerate(special_token_sorted):
             self.vocab[256 + i] = special_token.encode("utf-8")
 
+        if special_token_sorted:
+            special_token_pattern = "(" + "|".join(regex.escape(token) for token in special_token_sorted) + ")"
+        else:
+            special_token_pattern = None
+
+        print(f"reading {input_path}...", flush=True)
         with open(input_path, encoding="utf-8") as f:
             text = f.read()
 
-        if special_token_sorted:
-            special_token_pattern = "(" + "|".join(regex.escape(token) for token in special_token_sorted) + ")"
+        print("pretokenizing...", flush=True)
+        if special_token_pattern:
             text_parts = regex.split(special_token_pattern, text)
         else:
             text_parts = [text]
@@ -84,6 +106,8 @@ class bpe_tokenizer:
             if part == "" or part in self.special_tokens:
                 continue
             pretoken_counts.update(regex.findall(PAT, part))
+
+        print(f"building merge indexes; unique pretokens={len(pretoken_counts)}", flush=True)
 
         word_splits = []
         word_frequencies = []
@@ -101,17 +125,28 @@ class bpe_tokenizer:
                 pair_counts[pair] += frequency
                 pair_to_words[pair].add(word_index)
 
+        pair_heap = [(-count, _ReversePair(pair), pair) for pair, count in pair_counts.items()]
+        heapq.heapify(pair_heap)
+
         next_token_id = len(self.vocab)
+        print(f"starting BPE merges: vocab {len(self.vocab)}/{vocab_size}", flush=True)
         while len(self.vocab) < vocab_size:
-            if not pair_counts:
+            while pair_heap:
+                negative_count, _, pair = heapq.heappop(pair_heap)
+                if pair_counts.get(pair, 0) == -negative_count:
+                    most_common_pair = pair
+                    break
+            else:
                 break
 
-            most_common_pair = max(pair_counts, key=lambda pair: (pair_counts[pair], pair))
             self.vocab[next_token_id] = most_common_pair[0] + most_common_pair[1]
             next_token_id += 1
             self.merges.append(most_common_pair)
+            if len(self.vocab) % 100 == 0:
+                print(f"training BPE: vocab {len(self.vocab)}/{vocab_size}", flush=True)
 
             affected_word_indices = list(pair_to_words[most_common_pair])
+            changed_pairs = set()
             for word_index in affected_word_indices:
                 old_split = word_splits[word_index]
                 frequency = word_frequencies[word_index]
@@ -119,6 +154,7 @@ class bpe_tokenizer:
                 for i in range(len(old_split) - 1):
                     pair = (old_split[i], old_split[i + 1])
                     old_pairs.add(pair)
+                    changed_pairs.add(pair)
                     pair_counts[pair] -= frequency
                     if pair_counts[pair] == 0:
                         del pair_counts[pair]
@@ -138,8 +174,14 @@ class bpe_tokenizer:
 
                 for i in range(len(new_split) - 1):
                     pair = (new_split[i], new_split[i + 1])
+                    changed_pairs.add(pair)
                     pair_counts[pair] += frequency
                     pair_to_words[pair].add(word_index)
+
+            for pair in changed_pairs:
+                count = pair_counts.get(pair, 0)
+                if count:
+                    heapq.heappush(pair_heap, (-count, _ReversePair(pair), pair))
 
         self._refresh_indexes()
         return self.vocab, self.merges
