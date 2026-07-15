@@ -17,7 +17,10 @@ from cs336_basics.rmsnorm import RMSNorm
 from cs336_basics.swiglu import SwiGLU
 from cs336_basics.rope import RoPE
 from cs336_basics.softmax import Softmax
-from cs336_basics.attention import ScaledDotProductAttention, MultiHeadSelfAttention
+from cs336_basics.attention import ScaledDotProductAttention, MultiHeadSelfAttentionWithRoPE
+from cs336_basics.transformer import TransformerBlock
+from cs336_basics.transformer import TransformerLM
+from cs336_basics.cross_entropy import CrossEntropy
 
 
 def run_linear(
@@ -223,7 +226,7 @@ def run_multihead_self_attention_with_rope(
         implementation with the given QKV projection weights and input features.
     """
 
-    multihead_self_attention_with_rope = MultiHeadSelfAttention(d_model, num_heads)
+    multihead_self_attention_with_rope = MultiHeadSelfAttentionWithRoPE(d_model, num_heads, max_seq_len)
     state_dict = multihead_self_attention_with_rope.state_dict()
     state_dict["W_Q"] = q_proj_weight
     state_dict["W_K"] = k_proj_weight
@@ -329,29 +332,21 @@ def run_transformer_block(
         Float[Tensor, "batch sequence_length d_model"] Tensor with the output of
         running the Transformer block on the input features while using RoPE.
     """
-    attn_input = run_rmsnorm(d_model, 1e-5, weights["ln1.weight"], in_features)
-    attn_output = run_multihead_self_attention_with_rope(
-        d_model=d_model,
-        num_heads=num_heads,
-        max_seq_len=max_seq_len,
-        theta=theta,
-        q_proj_weight=weights["attn.q_proj.weight"],
-        k_proj_weight=weights["attn.k_proj.weight"],
-        v_proj_weight=weights["attn.v_proj.weight"],
-        o_proj_weight=weights["attn.output_proj.weight"],
-        in_features=attn_input,
-    )
-    x = in_features + attn_output
-    ffn_input = run_rmsnorm(d_model, 1e-5, weights["ln2.weight"], x)
-    ffn_output = run_swiglu(
-        d_model=d_model,
-        d_ff=d_ff,
-        w1_weight=weights["ffn.w1.weight"],
-        w2_weight=weights["ffn.w2.weight"],
-        w3_weight=weights["ffn.w3.weight"],
-        in_features=ffn_input,
-    )
-    return x + ffn_output
+    
+    transformer = TransformerBlock(d_model, num_heads, d_ff, theta, max_seq_len)
+    state_dict = transformer.state_dict()
+    state_dict["attention.W_Q"] = weights["attn.q_proj.weight"]
+    state_dict["attention.W_K"] = weights["attn.k_proj.weight"]
+    state_dict["attention.W_V"] = weights["attn.v_proj.weight"]
+    state_dict["attention.W_O"] = weights["attn.output_proj.weight"]
+    state_dict["rmsnorm1.gain"] = weights["ln1.weight"]
+    state_dict["rmsnorm2.gain"] = weights["ln2.weight"]
+    state_dict["ff.W1"] = weights["ffn.w1.weight"]
+    state_dict["ff.W2"] = weights["ffn.w2.weight"]
+    state_dict["ff.W3"] = weights["ffn.w3.weight"]
+    transformer.load_state_dict(state_dict)
+    out = transformer(in_features)
+    return out
 
 
 def run_transformer_lm(
@@ -433,21 +428,25 @@ def run_transformer_lm(
         Float[Tensor, "batch_size sequence_length vocab_size"]: Tensor with the predicted unnormalized
         next-word distribution for each token.
     """
-    x = run_embedding(vocab_size, d_model, weights["token_embeddings.weight"], in_indices)
-    for layer_idx in range(num_layers):
-        prefix = f"layers.{layer_idx}."
-        layer_weights = {key.removeprefix(prefix): value for key, value in weights.items() if key.startswith(prefix)}
-        x = run_transformer_block(
-            d_model=d_model,
-            num_heads=num_heads,
-            d_ff=d_ff,
-            max_seq_len=context_length,
-            theta=rope_theta,
-            weights=layer_weights,
-            in_features=x,
-        )
-    x = run_rmsnorm(d_model, 1e-5, weights["ln_final.weight"], x)
-    return run_linear(d_model, vocab_size, weights["lm_head.weight"], x)
+    
+    transformer = TransformerLM(vocab_size, context_length, num_layers, d_model, num_heads, d_ff, rope_theta)
+    state_dict = transformer.state_dict()
+    state_dict["embedding.embedding_matrix"] = weights["token_embeddings.weight"]
+    for i in range(num_layers):
+        state_dict[f"transformer_blocks.{i}.attention.W_Q"] = weights[f"layers.{i}.attn.q_proj.weight"]
+        state_dict[f"transformer_blocks.{i}.attention.W_K"] = weights[f"layers.{i}.attn.k_proj.weight"]
+        state_dict[f"transformer_blocks.{i}.attention.W_V"] = weights[f"layers.{i}.attn.v_proj.weight"]
+        state_dict[f"transformer_blocks.{i}.attention.W_O"] = weights[f"layers.{i}.attn.output_proj.weight"]
+        state_dict[f"transformer_blocks.{i}.rmsnorm1.gain"] = weights[f"layers.{i}.ln1.weight"]
+        state_dict[f"transformer_blocks.{i}.rmsnorm2.gain"] = weights[f"layers.{i}.ln2.weight"]
+        state_dict[f"transformer_blocks.{i}.ff.W1"] = weights[f"layers.{i}.ffn.w1.weight"]
+        state_dict[f"transformer_blocks.{i}.ff.W2"] = weights[f"layers.{i}.ffn.w2.weight"]
+        state_dict[f"transformer_blocks.{i}.ff.W3"] = weights[f"layers.{i}.ffn.w3.weight"]
+    state_dict["lm_head.weight"] = weights["lm_head.weight"]
+    state_dict["rmsnorm.gain"] = weights["ln_final.weight"]
+    transformer.load_state_dict(state_dict)
+    out = transformer(in_indices)
+    return out
 
 
 def run_rmsnorm(
@@ -551,9 +550,8 @@ def run_cross_entropy(
     Returns:
         Float[Tensor, ""]: The average cross-entropy loss across examples.
     """
-    logsumexp = torch.logsumexp(inputs, dim=-1)
-    target_logits = inputs.gather(dim=-1, index=targets.unsqueeze(-1)).squeeze(-1)
-    return torch.mean(logsumexp - target_logits)
+    cross_entropy = CrossEntropy()
+    return cross_entropy(inputs, targets)
 
 
 def run_gradient_clipping(parameters: Iterable[torch.nn.Parameter], max_l2_norm: float) -> None:

@@ -21,13 +21,14 @@ class ScaledDotProductAttention(nn.Module):
         softmax = softmax(scores, dim=-1)
         return einsum(softmax, V, "... n m, ... m d_v -> ... n d_v")
 
-class MultiHeadSelfAttention(nn.Module):
-    def __init__(self, d_model: int, num_heads: int, device=None, dtype=None):
+class MultiHeadSelfAttentionWithRoPE(nn.Module):
+    def __init__(self, d_model: int, num_heads: int, max_seq_len: int, device=None, dtype=None):
         super().__init__()
         self.d_model = d_model
         self.num_heads = num_heads
         self.d_k = d_model // num_heads
         self.d_v = d_model // num_heads
+        self.max_seq_len = max_seq_len
         self.device = device
         self.dtype = dtype
         self.W_Q = nn.Parameter(torch.empty(d_model, d_model, device=device, dtype=dtype))
@@ -47,7 +48,7 @@ class MultiHeadSelfAttention(nn.Module):
         mask = torch.tril(torch.ones(sequence_length, sequence_length, device=self.device, dtype=torch.bool))
         if token_positions is None:
             token_positions = torch.arange(sequence_length, device=x.device)
-        rope = RoPE(theta=theta, d_k=self.d_k, max_seq_len=sequence_length, device=self.device, dtype=self.dtype)
+        rope = RoPE(theta=theta, d_k=self.d_k, max_seq_len=self.max_seq_len, device=self.device, dtype=self.dtype)
         Q_rope = rope(Q_split, token_positions)
         K_rope = rope(K_split, token_positions)
         out = scaled_dot_product_attention(Q_rope, K_rope, V_split, mask)
